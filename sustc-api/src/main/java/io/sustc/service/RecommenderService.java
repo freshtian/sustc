@@ -1,103 +1,283 @@
-package io.sustc.service;
-
-import java.util.List;
+package io.sustc.service.impl;
 
 import io.sustc.dto.AuthInfo;
+import io.sustc.service.RecommenderService;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Service;
 
-public interface RecommenderService {
+import javax.sql.DataSource;
+import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.util.ArrayList;
+import java.util.List;
 
-    /**
-     * Recommends a list of top 5 similar videos for a video.
-     * The similarity is defined as the number of users (in the database) who have watched both videos.
-     * If two videos have the same similarity,
-     * sort them by their bv in ascending order,
-     *
-     * @param bv the current video
-     * @return a list of video {@code bv}s
-     * @apiNote You may consider the following corner cases:
-     * <ul>
-     *   <li>cannot find a video corresponding to the {@code bv}</li>
-     * </ul>
-     * If any of the corner case happened, {@code null} shall be returned.
-     */
-    List<String> recommendNextVideo(String bv);
 
-    /**
-     * Recommends videos for anonymous users, based on the popularity.
-     * Evaluate the video's popularity from the following aspects:
-     * <ol>
-     *   <li>"like": the rate of watched users who also liked this video</li>
-     *   <li>"coin": the rate of watched users who also donated coin to this video</li>
-     *   <li>"fav": the rate of watched users who also collected this video</li>
-     *   <li>"danmu": the average number of danmus sent by one watched user</li>
-     *   <li>"finish": the average video watched percentage of one watched user</li>
-     * </ol>
-     * The recommendation score can be calculated as:
-     * <pre>
-     *   score = like + coin + fav + danmu + finish
-     * </pre>
-     *
-     * @param pageSize the page size, if there are less than {@code pageSize} videos, return all of them
-     * @param pageNum  the page number, starts from 1
-     * @return a list of video {@code bv}s, sorted by the recommendation score
-     * @implNote 
-     * Though users can like/coin/favorite a video without watching it, the rates of these values should be clamped to 1.
-     * If no one has watched this video, all the five scores shall be 0.
-     * If the requested page is empty, return an empty list.
-     * @apiNote You may consider the following corner cases:
-     * <ul>
-     *   <li>{@code pageSize} and/or {@code pageNum} is invalid (any of them <= 0)</li>
-     * </ul>
-     * If any of the corner case happened, {@code null} shall be returned.
-     */
-    List<String> generalRecommendations(int pageSize, int pageNum);
 
-    /**
-     * Recommends videos for a user, restricted on their interests.
-     * The user's interests are defined as the videos that the user's friend(s) have watched,
-     * filter out the videos that the user has already watched.
-     * Friend(s) of current user is/are the one(s) who is/are both the current user' follower and followee at the same time.
-     * Sort the videos by:
-     * <ol>
-     *   <li>The number of friends who have watched the video</li>
-     *   <li>The video owner's level</li>
-     *   <li>The video's public time (newer videos are preferred)</li>
-     * </ol>
-     *
-     * @param auth     the current user's authentication information to be recommended
-     * @param pageSize the page size, if there are less than {@code pageSize} videos, return all of them
-     * @param pageNum  the page number, starts from 1
-     * @return a list of video {@code bv}s
-     * @implNote
-     * If the current user's interest is empty, return {@link io.sustc.service.RecommenderService#generalRecommendations(int, int)}.
-     * If the requested page is empty, return an empty list
-     * @apiNote You may consider the following corner cases:
-     * <ul>
-     *   <li>{@code auth} is invalid, as stated in {@link io.sustc.service.UserService#deleteAccount(AuthInfo, long)}</li>
-     *   <li>{@code pageSize} and/or {@code pageNum} is invalid (any of them <= 0)</li>
-     * </ul>
-     * If any of the corner case happened, {@code null} shall be returned.
-     */
-    List<String> recommendVideosForUser(AuthInfo auth, int pageSize, int pageNum);
+@Service
+@Slf4j
+public class RecommenderServicelmpl implements RecommenderService {
+    @Autowired
+    private  DataSource dataSource;
+    //  rec video --bv "BV1yX4y1T7nY"
+    @Override
+    public List<String> recommendNextVideo(String bv) {
+        if (!checkbv(bv)) {
+            return null;
+        }
+        List<String> recommend = new ArrayList<>();
+        String sql = "with people as (select viewer_mid from watched where video_bv = ?)\n" +
+                "select video_bv, count(*) as similarity\n" +
+                "from people\n" +
+                "         join watched on people.viewer_mid = watched.viewer_mid\n" +
+                "where video_bv <> ?\n" +
+                "group by video_bv\n" +
+                "order by similarity desc\n" +
+                "limit 5;";
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement stmt = conn.prepareStatement(sql)) {
+            stmt.setString(1, bv);
+             stmt.setString(2, bv); // Add bv as parameter for the second placeholder
+            ResultSet rs = stmt.executeQuery();
+            while (rs.next()) {
+                recommend.add(rs.getString("video_bv"));
+            }
+            stmt.close();
+            conn.close();
+        } catch (SQLException e) {
+            throw new RuntimeException(e);
+        }
+        return recommend;
+    }
+    //   rec general  5 10
+    @Override
+    public List<String> generalRecommendations(int pageSize, int pageNum) {
+        if(pageNum<=0||pageSize<=0){
+            return null;
+        }
+        List<String> recommend = new ArrayList<>();
+        String sql="\n" +
+                "with danmu_count as\n" +
+                "         (SELECT CAST(count(*) AS DECIMAL(10, 5)) / CAST(Videos.watched_counter AS DECIMAL(10, 5)) AS avgdanmu,\n" +
+                "                 video_bv,\n" +
+                "                 COUNT(*)                                                                          as danmu_count,\n" +
+                "                 watched_counter\n" +
+                "          FROM danmu\n" +
+                "                   join videos on Videos.bv = Danmu.video_bv\n" +
+                "          GROUP BY video_bv, watched_counter)\n" +
+                "select bv,avgWatch,\n" +
+                "       case Videos.watched_counter\n" +
+                "           when 0 then 0\n" +
+                "           else\n" +
+                "                       CAST(liked_counter AS DECIMAL(10, 5)) / CAST(Videos.watched_counter AS DECIMAL(10, 5)) +\n" +
+                "                       CAST(coin_counter AS DECIMAL(10, 5)) / CAST(Videos.watched_counter AS DECIMAL(10, 5)) +\n" +
+                "                       CAST(collected_counter AS DECIMAL(10, 5)) / CAST(Videos.watched_counter AS DECIMAL(10, 5)) +\n" +
+                "                       danmu_count.avgdanmu + avgWatch\n" +
+                "           end as Score\n" +
+                "FROM Videos\n" +
+                "         left join(select video_bv, avg(view_time)/Videos.duration as avgWatch, COUNT(*) as Peoplenum from watched join videos on watched.video_bv=Videos.bv\n" +
+                "                                                                                       group by video_bv, Videos.duration) w\n" +
+                "                  ON Videos.bv = w.video_bv\n" +
+                "         join danmu_count on danmu_count.video_bv = Videos.bv\n" +
+                "\n" +
+                "ORDER BY Score desc\n" +
+                "limit ? OFFSET (?-1)*?;";
 
-    /**
-     * Recommends friends for a user, based on their common followings.
-     * Find all users that are not currently followed by the user, and have at least one common following with the user.
-     * Sort the users by the number of common followings in descending order.
-     * If two users have the same number of common followings,
-     * sort them by their {@code level} in descending order, then by their {@code mid} in ascending order.
-     *
-     * @param auth     the current user's authentication information to be recommended
-     * @param pageSize the page size, if there are less than {@code pageSize} users, return all of them
-     * @param pageNum  the page number, starts from 1
-     * @return a list of {@code mid}s of the recommended users
-     * @implNote If the requested page is empty, return an empty list
-     * @apiNote You may consider the following corner cases:
-     * <ul>
-     *   <li>{@code auth} is invalid, as stated in {@link io.sustc.service.UserService#deleteAccount(AuthInfo, long)}</li>
-     *   <li>{@code pageSize} and/or {@code pageNum} is invalid (any of them <= 0)</li>
-     * </ul>
-     * If any of the corner case happened, {@code null} shall be returned.
-     */
-    List<Long> recommendFriends(AuthInfo auth, int pageSize, int pageNum);
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement stmt = conn.prepareStatement(sql)) {
+            stmt.setInt(1, pageSize);
+            stmt.setInt(2, pageNum);
+            stmt.setInt(3, pageSize);
+            ResultSet rs = stmt.executeQuery();
+            while (rs.next()) {
+                recommend.add(rs.getString("bv"));
+            }
+            stmt.close();
+            conn.close();
+        } catch (SQLException e) {
+            throw new RuntimeException(e);
+        }
+        return recommend;
+    }
+    // rec user -mid 1384516 --pwd "Y*$=o90vEv38^6"
+    @Override
+    public List<String> recommendVideosForUser(AuthInfo auth, int pageSize, int pageNum) {
+        if(pageNum<=0||pageSize<=0){
+            return  null;
+        }
+        List<String> recommend = new ArrayList<>();
+        List<Long> friend = new ArrayList<>();
+        String sql2 ="select followee_mid as mid  from  (\n" +
+                "             select follower_mid from follow where followee_mid=? --auth的粉丝\n" +
+                "    ) f1\n" +
+                "    join (\n" +
+                "             select followee_mid from follow where follower_mid=? --auth的关注\n" +
+                " )f2 on f1.follower_mid =f2.followee_mid;";
+        String sql= "\n" +
+                "with friend as (\n" +
+                "select followee_mid as mid  from  (\n" +
+                "             select follower_mid from follow where followee_mid=? --auth的粉丝\n" +
+                ") f1\n" +
+                "    join (\n" +
+                "             select followee_mid from follow where follower_mid=? --auth的关注\n" +
+                " )f2\n" +
+                "        on f1.follower_mid =f2.followee_mid)\n" +
+                "\n" +
+                "             select video_bv,count(*)\n" +
+                "             from watched join friend on viewer_mid=mid\n" +
+                "             join videos on Videos.bv=watched.video_bv\n" +
+                "             join users on Videos.owner_mid= Users.mid\n" +
+                "                   where video_bv not in (\n" +
+                "            select video_bv from watched where viewer_mid=?   )\n" +
+                " group by video_bv,level,public_time\n" +
+                "order by\n" +
+                "    count(*) desc,level desc ,public_time desc\n" +
+                "limit ? offset (?-1)* ?";
+        long mid = isValidUser(auth);
+        if (mid == 0){
+            return null;
+        }
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement stmt = conn.prepareStatement(sql);
+             PreparedStatement stmt2 = conn.prepareStatement(sql2);
+        ) {
+        stmt2.setLong(1,mid);
+        stmt2.setLong(2,mid);
+            ResultSet rs2 = stmt2.executeQuery();
+            while (rs2.next()) {
+                friend.add(rs2.getLong("mid"));
+            }
+            if (friend.isEmpty()){
+                return  generalRecommendations( pageSize, pageNum);
+            }
+            stmt.setLong(1, mid);
+            stmt.setLong(2,mid);
+            stmt.setLong(3, mid);
+            stmt.setInt(4, pageSize);
+            stmt.setInt(5, pageNum);
+            stmt.setInt(6, pageSize);
+            ResultSet rs = stmt.executeQuery();
+            while (rs.next()) {
+                recommend.add(rs.getString("video_bv"));
+            }
+
+            stmt.close();
+            conn.close();
+        } catch (SQLException e) {
+            throw new RuntimeException(e);
+        }
+        return recommend;
+    }
+    //recommend friends --mid 1384516 --pwd "Y*$=o90vEv38^6"
+    @Override
+    public List<Long> recommendFriends(AuthInfo auth, int pageSize, int pageNum) {
+        if(pageNum<=0||pageSize<=0){
+            return  null;
+        }
+        List<Long> recommend = new ArrayList<>();
+        String sql="\n" +
+                "with UnfollowPleple as (select *\n" +
+                "                from follow\n" +
+                "                                       where follower_mid !=  ?),--auth还没关注的人\\n\" +\n" +
+                "                     myfollow as (select followee_mid from follow where follower_mid =  ?)--auth已经关注的人\\n\" +\n" +
+                "\n" +
+                "                select UnfollowPleple.follower_mid, count(*), (select level from Users where mid = UnfollowPleple.follower_mid) level\n" +
+                "                from myfollow\n" +
+                "                         join UnfollowPleple on myfollow.followee_mid = UnfollowPleple.followee_mid\n" +
+                "                where UnfollowPleple.follower_mid not in (select followee_mid from follow where follower_mid =  ?)\n" +
+                "                group by UnfollowPleple.follower_mid\n" +
+                "\n" +
+                "                order by count(*) DESC, level desc,unfollowPleple.follower_mid\n" +
+                "                LIMIT ? OFFSET (? - 1) * ?;";
+
+        long mid = isValidUser(auth);
+        if (mid == 0)
+            return null;
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement stmt = conn.prepareStatement(sql)) {
+
+            stmt.setLong(1,mid);
+            stmt.setLong(2, mid);
+            stmt.setLong(3, mid);
+            stmt.setInt(4, pageSize);
+            stmt.setInt(5, pageNum);
+            stmt.setInt(6, pageSize);
+            ResultSet rs = stmt.executeQuery();
+            while (rs.next()) {
+                recommend.add(rs.getLong("follower_mid"));
+            }
+            stmt.close();
+            conn.close();
+        } catch (SQLException e) {
+            throw new RuntimeException(e);
+        }
+
+        return recommend;
+    }
+
+
+
+    public boolean checkbv (String bv){
+        String InvalidBv = " select * from videos where bv = ? ";
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement stmt = conn.prepareStatement(InvalidBv)) {
+            stmt.setString(1, bv);
+            ResultSet rs = stmt.executeQuery();
+            rs.next();
+            if (rs.wasNull()) {
+                stmt.close();
+                conn.close();
+                return false;
+            }
+        } catch (SQLException e) {
+            throw new RuntimeException(e);
+        }
+        return true;
+    }
+
+    public long isValidUser(AuthInfo auth) {
+        try {
+            String sql = "select * from users where qq = ?";
+            Connection con = dataSource.getConnection();
+            PreparedStatement ps = con.prepareStatement(sql);
+            if (auth.getQq() != null) {
+
+                ps.setString(1, auth.getQq());
+                ;
+                ResultSet rs = ps.executeQuery();
+                if (rs.next()) {
+                    long mid = rs.getLong("mid");
+                    con.close();
+                    return mid;
+                }
+            } else if (auth.getWechat() != null) {
+                ps = con.prepareStatement("select * from users where wechat = ?");
+                ps.setString(1, auth.getWechat());
+                ResultSet rs = ps.executeQuery();
+                if (rs.next()) {
+                    long mid = rs.getLong("mid");
+                    con.close();
+                    return mid;
+                }
+            } else if (auth.getMid() > 0 && auth.getPassword() != null) {
+                ps = con.prepareStatement("select * from users where mid = ?");
+                ps.setLong(1, auth.getMid());
+                ResultSet rs = ps.executeQuery();
+                if (rs.next()) {
+                    if (rs.getString("password").equals(DatabaseServiceImpl.hashPassword(auth.getPassword()))) {
+                        long mid = rs.getLong("mid");
+                        con.close();
+                        return mid;
+                    }
+                }
+            }
+            con.close();
+            return 0;
+        } catch (SQLException e) {
+            e.printStackTrace();
+            throw new RuntimeException(e);
+        }
+    }
 }
